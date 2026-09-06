@@ -1,8 +1,38 @@
 import express from 'express';
 import { spawn } from 'child_process';
+import fs from 'fs';
+import path from 'path';
+import crypto from 'crypto';
+import os from 'os';
 
 const app = express();
 const PORT = process.env.PORT || 7860;
+
+// โฟลเดอร์เก็บแคชวิดีโอที่ถอดรหัสแล้ว
+const CACHE_DIR = path.join(os.tmpdir(), 'melolo_cache');
+try { fs.mkdirSync(CACHE_DIR, { recursive: true }); } catch (e) {}
+
+// เก็บงานที่กำลังดาวน์โหลด/ถอดรหัสอยู่ เพื่อไม่ให้ทำซ้ำ
+const activeJobs = new Map();
+
+// เคลียร์แคชไฟล์ที่เก่าเกิน 2 ชั่วโมงทุกๆ 30 นาที เพื่อประหยัดพื้นที่ดิสก์
+setInterval(() => {
+  try {
+    if (!fs.existsSync(CACHE_DIR)) return;
+    const files = fs.readdirSync(CACHE_DIR);
+    const now = Date.now();
+    for (const file of files) {
+      if (!file.endsWith('.mp4')) continue;
+      const filePath = path.join(CACHE_DIR, file);
+      try {
+        const stat = fs.statSync(filePath);
+        if (now - stat.mtimeMs > 2 * 3600 * 1000) {
+          fs.unlinkSync(filePath);
+        }
+      } catch (err) {}
+    }
+  } catch (err) {}
+}, 30 * 60 * 1000);
 
 // ── ฟังก์ชันถอดรหัส spade_a เพื่อดึง AES-128 Content Key สำหรับ Melolo ─────────────
 function decodeBase36(c) {
@@ -55,6 +85,27 @@ function deriveKey(spadeAStr) {
   }
 }
 
+const PROXY_SECRET = process.env.PROXY_SECRET || "TumnakSeries_Melolo_Secure_2026!@#";
+
+function verifyProxyToken(urlStr, expires, token) {
+  if (!token || !expires) return false;
+  const now = Math.floor(Date.now() / 1000);
+  if (parseInt(expires, 10) < now) return false; // หมดอายุแล้ว
+
+  try {
+    const hmac = crypto.createHmac('sha256', PROXY_SECRET);
+    hmac.update(`${urlStr}|${expires}`);
+    const expected = hmac.digest('hex');
+
+    const expectedBuf = Buffer.from(expected, 'hex');
+    const tokenBuf = Buffer.from(token, 'hex');
+    if (expectedBuf.length !== tokenBuf.length) return false;
+    return crypto.timingSafeEqual(expectedBuf, tokenBuf);
+  } catch (e) {
+    return false;
+  }
+}
+
 // ── เปิด CORS ให้ทุกเว็บดึงไปเล่นได้ ไม่ติดบล็อก ─────────────────────────────
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -83,23 +134,30 @@ app.get('/', (req, res) => {
       </head>
       <body>
         <div class="card">
-          <div class="badge">ONLINE 100%</div>
-          <h2>🚀 Melolo Video Transcoding Proxy</h2>
-          <p>ระบบถอดรหัส CENC AES-128 และแปลงภาพเป็น H.264 แบบสดๆ (แก้ปัญหาจอดำ 100%)</p>
-          <hr style="border-color: #334155; margin: 20px 0;">
-          <p><b>วิธีเรียกใช้งานในเว็บ:</b></p>
-          <p><code>/play?url=&lt;VIDEO_URL&gt;&key=&lt;HEX_KEY&gt;</code></p>
+          <div class="badge">SECURED &amp; PROTECTED</div>
+          <h2>🛡️ Tumnak Video Proxy Service</h2>
+          <p>Private video service for Tumnak Series. Direct hotlinking and unauthorized access are strictly forbidden.</p>
         </div>
       </body>
     </html>
   `);
 });
 
-// ── Endpoint หลัก: แปลงสดและสตรีมตรงเข้าแท็ก <video> ───────────────────────
-app.get('/play', (req, res) => {
+// ── Endpoint หลัก: แปลงและสตรีมตรงพร้อม Range Support และ Full Duration ─────
+app.get('/play', async (req, res) => {
   const videoUrl = req.query.url;
   if (!videoUrl) {
     return res.status(400).send('❌ กรุณาระบุพารามิเตอร์ ?url=');
+  }
+
+  // 🛡️ ป้องกันคนอื่นขโมยลิงก์ไปเปิดเล่นตรงๆ: ตรวจสอบ HMAC Token และวันหมดอายุ
+  const token = req.query.token;
+  const expires = req.query.expires;
+  const masterSecret = req.query.secret || req.headers['x-proxy-secret'];
+
+  const isAuthorized = (masterSecret === PROXY_SECRET) || verifyProxyToken(videoUrl, expires, token);
+  if (!isAuthorized) {
+    return res.status(403).type('text/plain; charset=utf-8').send('⛔ 403 Forbidden: ปฏิเสธการเข้าถึง - ลิงก์ไม่ได้รับอนุญาตหรือหมดอายุแล้ว');
   }
 
   // ดึงหรือคำนวณ Content Key สำหรับถอดรหัส CENC (ถ้ามี)
@@ -108,92 +166,138 @@ app.get('/play', (req, res) => {
     decKey = deriveKey(req.query.spade_a);
   }
 
-  // จัดเตรียมพารามิเตอร์สำหรับ FFmpeg
-  const ffmpegArgs = [];
+  // สร้าง Cache Key สำหรับไฟล์นี้
+  const hash = crypto.createHash('md5').update(videoUrl + decKey).digest('hex');
+  const cacheFile = path.join(CACHE_DIR, `${hash}.mp4`);
+  const tempFile = path.join(CACHE_DIR, `${hash}.tmp.mp4`);
 
-  // 1. ป้อนคีย์ถอดรหัสเข้า FFmpeg ทันที
-  if (decKey) {
-    ffmpegArgs.push('-decryption_key', decKey);
-  }
-
-  const doTranscode = req.query.transcode === 'true' || req.query.transcode === '1';
-
-  ffmpegArgs.push(
-    '-user_agent', 'com.worldance.drama/53018 (Linux; U; Android 12; th; ASUSAI2501B)',
-    '-reconnect', '1',
-    '-reconnect_streamed', '1',
-    '-reconnect_delay_max', '5',
-    '-i', videoUrl
-  );
-
-  if (doTranscode) {
-    ffmpegArgs.push(
-      '-c:v', 'libx264',
-      '-preset', 'ultrafast',
-      '-tune', 'zerolatency',
-      '-crf', '23',
-      '-pix_fmt', 'yuv420p',
-      '-c:a', 'aac',
-      '-b:a', '128k'
-    );
-  } else {
-    // ถอดรหัส AES-128 CENC ผ่าน FFmpeg โดยตรง ไม่ต้องเสียเวลาแปลงภาพ เล่นได้ทันทีใน 0.05 วินาที
-    ffmpegArgs.push('-c', 'copy');
-  }
-
-  ffmpegArgs.push(
-    '-f', 'mp4',
-    '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
-    'pipe:1'
-  );
-
-  const ffmpeg = spawn('ffmpeg', ffmpegArgs);
-
-  let headersSent = false;
-  let stderrBuffer = '';
-
-  ffmpeg.stdout.on('data', (chunk) => {
-    if (!headersSent) {
-      res.writeHead(200, {
+  // ฟังก์ชันส่งไฟล์ MP4 พร้อม Range Support และ Header ครบถ้วน
+  const sendCachedVideo = () => {
+    return res.sendFile(cacheFile, {
+      acceptRanges: true,
+      headers: {
         'Content-Type': 'video/mp4',
-        'Cache-Control': 'no-cache, no-store',
-        'Connection': 'keep-alive',
         'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, OPTIONS',
+        'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
         'Access-Control-Allow-Headers': '*',
-        'Accept-Ranges': 'none'
-      });
-      headersSent = true;
+        'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges, Content-Type',
+        'Cache-Control': 'public, max-age=86400'
+      }
+    });
+  };
+
+  // 1. ถ้ามีไฟล์ในแคชแล้ว และขนาดไฟล์สมบูรณ์ (> 100KB) ส่งทันที!
+  if (fs.existsSync(cacheFile)) {
+    try {
+      const st = fs.statSync(cacheFile);
+      if (st.size > 102400) {
+        return sendCachedVideo();
+      }
+    } catch (e) {}
+  }
+
+  // 2. ถ้ากำลังประมวลผลไฟล์นี้อยู่ ให้รอจนเสร็จแล้วส่ง
+  if (activeJobs.has(hash)) {
+    try {
+      await activeJobs.get(hash);
+      if (fs.existsSync(cacheFile)) {
+        return sendCachedVideo();
+      }
+    } catch (e) {}
+  }
+
+  // 3. เริ่มกระบวนการถอดรหัส CENC แบบ Faststart (ใช้เวลาเพียง 1-2 วินาที)
+  // ผลลัพธ์: จะได้ไฟล์ MP4 แท้ที่มีข้อมูลเวลาเต็มเรื่อง (Full Duration) และกรอเวลาได้ทันที
+  const decryptPromise = new Promise((resolve, reject) => {
+    const ffmpegArgs = [];
+    if (decKey) {
+      ffmpegArgs.push('-decryption_key', decKey);
     }
-    res.write(chunk);
+    ffmpegArgs.push(
+      '-user_agent', 'com.worldance.drama/53018 (Linux; U; Android 12; th; ASUSAI2501B)',
+      '-reconnect', '1',
+      '-reconnect_streamed', '1',
+      '-reconnect_delay_max', '5',
+      '-i', videoUrl,
+      '-c', 'copy',
+      '-movflags', '+faststart',
+      '-y',
+      tempFile
+    );
+
+    const ff = spawn('ffmpeg', ffmpegArgs);
+    let stderrBuf = '';
+    ff.stderr.on('data', (d) => {
+      stderrBuf += d.toString();
+      if (stderrBuf.length > 2000) stderrBuf = stderrBuf.slice(-2000);
+    });
+
+    ff.on('close', (code) => {
+      if (code === 0 && fs.existsSync(tempFile)) {
+        try {
+          fs.renameSync(tempFile, cacheFile);
+          resolve(true);
+        } catch (err) {
+          reject(err);
+        }
+      } else {
+        try { if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile); } catch (e) {}
+        reject(new Error(`FFmpeg exit code ${code}: ${stderrBuf}`));
+      }
+    });
+
+    ff.on('error', (err) => {
+      try { if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile); } catch (e) {}
+      reject(err);
+    });
   });
 
-  ffmpeg.stderr.on('data', (data) => {
-    stderrBuffer += data.toString();
-    if (stderrBuffer.length > 2000) {
-      stderrBuffer = stderrBuffer.slice(-2000);
-    }
-  });
+  activeJobs.set(hash, decryptPromise);
 
-  ffmpeg.on('close', (code) => {
-    if (!headersSent) {
-      res.status(500).type('text/plain').send(`Transcoding Error (code ${code}):\n${stderrBuffer}`);
-    } else {
-      res.end();
-    }
-  });
+  try {
+    await decryptPromise;
+    activeJobs.delete(hash);
+    return sendCachedVideo();
+  } catch (err) {
+    activeJobs.delete(hash);
+    console.error('Faststart error, falling back to pipe stream:', err.message);
 
-  ffmpeg.on('error', (err) => {
-    console.error('FFmpeg Process Error:', err);
-    if (!headersSent) res.status(500).send('FFmpeg Process Failed');
-  });
+    // Fallback สำรอง: หากเกิดข้อผิดพลาดในการสร้างไฟล์แคช ให้สตรีมสดผ่าน Pipe ทันที
+    const fallbackArgs = [];
+    if (decKey) fallbackArgs.push('-decryption_key', decKey);
+    fallbackArgs.push(
+      '-user_agent', 'com.worldance.drama/53018 (Linux; U; Android 12; th; ASUSAI2501B)',
+      '-reconnect', '1',
+      '-reconnect_streamed', '1',
+      '-reconnect_delay_max', '5',
+      '-i', videoUrl,
+      '-c', 'copy',
+      '-f', 'mp4',
+      '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+      'pipe:1'
+    );
 
-  // เมื่อปิดหน้าต่างให้ kill FFmpeg ทันทีเพื่อคืน RAM/CPU
-  res.on('close', () => {
-    if (!res.writableEnded) {
-      ffmpeg.kill('SIGKILL');
-    }
-  });
+    const ffLive = spawn('ffmpeg', fallbackArgs);
+    let headersSent = false;
+    ffLive.stdout.on('data', (chunk) => {
+      if (!headersSent) {
+        res.writeHead(200, {
+          'Content-Type': 'video/mp4',
+          'Cache-Control': 'no-cache, no-store',
+          'Connection': 'keep-alive',
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
+          'Access-Control-Allow-Headers': '*',
+          'Accept-Ranges': 'none'
+        });
+        headersSent = true;
+      }
+      res.write(chunk);
+    });
+
+    ffLive.on('close', () => res.end());
+    req.on('close', () => { if (!res.writableEnded) ffLive.kill('SIGKILL'); });
+  }
 });
 
 app.listen(PORT, () => {
