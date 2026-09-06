@@ -1,0 +1,13 @@
+{
+  "name": "melolo-transcoder-proxy",
+  "version": "1.0.0",
+  "description": "Real-time Live Transcoding Proxy for Melolo & ByteDance Videos (HEVC to H.264)",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
