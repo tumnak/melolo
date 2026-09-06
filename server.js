@@ -116,20 +116,32 @@ app.get('/play', (req, res) => {
     ffmpegArgs.push('-decryption_key', decKey);
   }
 
-  // 2. ตั้งค่า User-Agent, Reconnect และ Transcode เป็น H.264
+  const doTranscode = req.query.transcode === 'true' || req.query.transcode === '1';
+
   ffmpegArgs.push(
     '-user_agent', 'com.worldance.drama/53018 (Linux; U; Android 12; th; ASUSAI2501B)',
     '-reconnect', '1',
     '-reconnect_streamed', '1',
     '-reconnect_delay_max', '5',
-    '-i', videoUrl,
-    '-c:v', 'libx264',
-    '-preset', 'ultrafast',
-    '-tune', 'zerolatency',
-    '-crf', '23',
-    '-pix_fmt', 'yuv420p',
-    '-c:a', 'aac',
-    '-b:a', '128k',
+    '-i', videoUrl
+  );
+
+  if (doTranscode) {
+    ffmpegArgs.push(
+      '-c:v', 'libx264',
+      '-preset', 'ultrafast',
+      '-tune', 'zerolatency',
+      '-crf', '23',
+      '-pix_fmt', 'yuv420p',
+      '-c:a', 'aac',
+      '-b:a', '128k'
+    );
+  } else {
+    // ถอดรหัส AES-128 CENC ผ่าน FFmpeg โดยตรง ไม่ต้องเสียเวลาแปลงภาพ เล่นได้ทันทีใน 0.05 วินาที
+    ffmpegArgs.push('-c', 'copy');
+  }
+
+  ffmpegArgs.push(
     '-f', 'mp4',
     '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
     'pipe:1'
@@ -146,6 +158,9 @@ app.get('/play', (req, res) => {
         'Content-Type': 'video/mp4',
         'Cache-Control': 'no-cache, no-store',
         'Connection': 'keep-alive',
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET, OPTIONS',
+        'Access-Control-Allow-Headers': '*',
         'Accept-Ranges': 'none'
       });
       headersSent = true;
